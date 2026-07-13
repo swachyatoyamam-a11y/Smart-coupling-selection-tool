@@ -1,0 +1,2 @@
+export interface Coupling { id:number; name:string; type:string; description:string; torque_min:number; torque_max:number; speed_min:number; speed_max:number; misalignment:string; shock_load:string; environment:string; maintenance:string; cost:string; applications:string; advantages:string; disadvantages:string; life:string; efficiency:number; working_principle:string; }
+export interface Recommendation { recommendation:Coupling; suitability_score:number; confidence_score:number; reasoning:string[]; alternatives:(Coupling & {score:number})[]; }
