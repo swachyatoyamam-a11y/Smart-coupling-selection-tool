@@ -19,6 +19,7 @@ export interface Coupling {
 }
 export interface RecommendedCoupling extends Coupling {
   qualifies_because: string[];
+  hub_configuration: string;
   driver_bore_configuration: BoreOption | null;
   driven_bore_configuration: BoreOption | null;
   optional_condition_notes: string[];

@@ -135,8 +135,10 @@ function RecommendationCard({c,result}){
     <dl className="mt-5 space-y-2 text-sm">
       <Row k="Continuous torque rating" v={torqueNative!=null?`${torqueNative.toLocaleString()} ${torqueUnit}`:NOT_SPECIFIED}/>
       <Row k="Peak overload torque" v={peakNative!=null?`${peakNative.toLocaleString()} ${torqueUnit}`:NOT_SPECIFIED}/>
-      <Row k="Driver bore configuration" v={c.driver_bore_configuration?`${c.driver_bore_configuration.label} — ${c.driver_bore_configuration[boreKey]} ${dimUnit} max`:'—'}/>
-      <Row k="Driven bore configuration" v={c.driven_bore_configuration?`${c.driven_bore_configuration.label} — ${c.driven_bore_configuration[boreKey]} ${dimUnit} max`:'—'}/>
+      <Row k="Hub configuration" v={c.hub_configuration}/>
+      <Row k="Driver-side hub/bore" v={c.driver_bore_configuration?`${c.driver_bore_configuration.label} — ${c.driver_bore_configuration[boreKey]} ${dimUnit} max`:'—'}/>
+      <Row k="Driven-side hub/bore" v={c.driven_bore_configuration?`${c.driven_bore_configuration.label} — ${c.driven_bore_configuration[boreKey]} ${dimUnit} max`:'—'}/>
+      {c.bore_options?.length>1 && <Row k="All documented hub options" v={c.bore_options.map(o=>`${o.label}: ${o[boreKey]??'—'} ${dimUnit}`).join(', ')}/>}
       {isSpacer ? <Row k="DBSE range" v={minDbse!=null?`${minDbse}–${maxDbse} ${dimUnit}${!c.dbse_max_documented?' (Std. length used as reference — no Max. C published)':''}`:NOT_SPECIFIED}/>
                 : <Row k="DBSE / spacer span" v="Not applicable — close-coupled design"/>}
       <Row k="Speed limit (as mfd.)" v={c.max_speed_as_mfd_rpm?`${c.max_speed_as_mfd_rpm.toLocaleString()} RPM`:NOT_SPECIFIED}/>

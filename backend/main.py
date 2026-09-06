@@ -259,12 +259,42 @@ def best_bore_mm_or_in(c: Coupling, native_unit: str) -> Optional[float]:
     return max(values) if values else None
 
 
+def hub_satisfies(c: Coupling, native_unit: str, required: float) -> bool:
+    """Hub-level check: does ANY documented hub configuration for this coupling SIZE
+    accommodate `required`? This is the "exhaust every hub configuration before rejecting
+    the size" rule - a size is only bore-rejected when every one of its catalog-documented
+    hub options (Std/XL/XXL for XTSR71, B & B1/B2 for Series 71, Internal/External for
+    close-coupled, or the single Max Bore for XTSR52) fails independently."""
+    key = "max_bore_mm" if native_unit == "mm" else "max_bore_in"
+    return any(o.get(key) is not None and o[key] >= required for o in c.bore_options)
+
+
 def smallest_sufficient_bore_option(c: Coupling, native_unit: str, required: float) -> Optional[dict]:
+    """The smallest hub configuration (by published bore) that accommodates `required`,
+    checked independently per shaft side - driver and driven each pick their own smallest
+    sufficient hub, exactly as the catalog's own worked examples do (e.g. a 1088 XTSR71
+    ordered with a Std hub on one side and an XXL hub on the other)."""
     key = "max_bore_mm" if native_unit == "mm" else "max_bore_in"
     fitting = [o for o in c.bore_options if o.get(key) is not None and o[key] >= required]
     if not fitting:
         return None
     return min(fitting, key=lambda o: o[key])
+
+
+def overall_hub_label(c: Coupling, native_unit: str, driver_hub: Optional[dict], driven_hub: Optional[dict]) -> str:
+    """Single headline hub-configuration name for a winning candidate, per the catalog's own
+    naming convention (e.g. 'coupling is a 1088 XTSR71 XXL' when only one side needed the
+    largest tier) - named after whichever side's hub has the larger published bore. Falls
+    back to the lone hub's name for single-hub-option products like XTSR52."""
+    if len(c.bore_options) <= 1:
+        return c.bore_options[0]["label"] if c.bore_options else NOT_SPECIFIED
+    if driver_hub is None or driven_hub is None:
+        return NOT_SPECIFIED
+    if driver_hub["label"] == driven_hub["label"]:
+        return driver_hub["label"]
+    key = "max_bore_mm" if native_unit == "mm" else "max_bore_in"
+    larger = driver_hub if driver_hub[key] >= driven_hub[key] else driven_hub
+    return f"{larger['label']} (driver: {driver_hub['label']}, driven: {driven_hub['label']})"
 
 
 def torque_rating(c: Coupling, native_unit: str) -> Optional[float]:
@@ -274,11 +304,14 @@ def torque_rating(c: Coupling, native_unit: str) -> Optional[float]:
 def check_candidate(c: Coupling, req: Request, required_torque: float, native_unit: str,
                      driver_native: float, driven_native: float, dbse_native: Optional[float]) -> dict:
     rating = torque_rating(c, native_unit)
-    best_bore = best_bore_mm_or_in(c, native_unit)
     result = {
         "torque": rating is not None and rating >= required_torque,
-        "driver_bore": best_bore is not None and driver_native <= best_bore,
-        "driven_bore": best_bore is not None and driven_native <= best_bore,
+        # Hub-level check: a size is only bore-rejected once EVERY documented hub
+        # configuration for it fails - never just its smallest/default hub. Driver and
+        # driven are each checked against the full set of hub options independently, since
+        # the catalog allows ordering a different hub tier per side (see overall_hub_label).
+        "driver_bore": hub_satisfies(c, native_unit, driver_native),
+        "driven_bore": hub_satisfies(c, native_unit, driven_native),
         "speed": c.max_speed_as_mfd_rpm is not None and req.speed <= c.max_speed_as_mfd_rpm,
         "temperature": True,
     }
@@ -297,13 +330,17 @@ def check_candidate(c: Coupling, req: Request, required_torque: float, native_un
 def qualification_notes(c: Coupling, req: Request, required_torque: float, native_unit: str, torque_unit_label: str,
                          driver_native: float, driven_native: float, dbse_native: Optional[float]) -> list[str]:
     rating = torque_rating(c, native_unit)
-    best_bore = best_bore_mm_or_in(c, native_unit)
     dim_unit = native_unit
-    notes = [
-        f"{c.name} rated {rating:,.0f} {torque_unit_label} continuous ≥ {required_torque:,.1f} {torque_unit_label} required.",
-        f"Driver ({driver_native:.2f} {dim_unit}) and driven ({driven_native:.2f} {dim_unit}) shafts both fit within the "
-        f"{best_bore:.2f} {dim_unit} maximum bore published for this size.",
-    ]
+    driver_hub = smallest_sufficient_bore_option(c, native_unit, driver_native)
+    driven_hub = smallest_sufficient_bore_option(c, native_unit, driven_native)
+    key = "max_bore_mm" if native_unit == "mm" else "max_bore_in"
+    notes = [f"{c.name} rated {rating:,.0f} {torque_unit_label} continuous ≥ {required_torque:,.1f} {torque_unit_label} required."]
+    if len(c.bore_options) > 1:
+        tried = ", ".join(f"{o['label']} ({o.get(key):.2f} {dim_unit})" if o.get(key) is not None else f"{o['label']} (not published)" for o in c.bore_options)
+        notes.append(f"Hub configurations evaluated for size {c.size} before considering a larger coupling size: {tried}.")
+    notes.append(f"Driver ({driver_native:.2f} {dim_unit}) fits the {driver_hub['label']} configuration "
+                 f"({driver_hub[key]:.2f} {dim_unit} max) and driven ({driven_native:.2f} {dim_unit}) fits the "
+                 f"{driven_hub['label']} configuration ({driven_hub[key]:.2f} {dim_unit} max) for this coupling size.")
     if c.coupling_type == "spacer" and dbse_native is not None:
         min_dbse = c.min_dbse_mm if native_unit == "mm" else c.min_dbse_in
         max_dbse = c.max_dbse_mm if native_unit == "mm" else c.max_dbse_in
@@ -322,8 +359,10 @@ def rejection_reason(c: Coupling, checks: dict, native_unit: str, torque_unit_la
             return f"{c.name}: continuous torque rating is not published in the {'Imperial' if native_unit == 'in' else 'Metric'} catalog for this size."
         return f"{c.name}: rated {rating:,.0f} {torque_unit_label} continuous < {required_torque:,.1f} {torque_unit_label} required."
     if not checks["driver_bore"] or not checks["driven_bore"]:
-        best_bore = best_bore_mm_or_in(c, native_unit)
-        return f"{c.name}: maximum available bore ({best_bore:.2f} {native_unit} if published) cannot accommodate the requested shaft diameter(s)."
+        key = "max_bore_mm" if native_unit == "mm" else "max_bore_in"
+        tried = ", ".join(f"{o['label']} ({o.get(key):.2f} {native_unit})" if o.get(key) is not None else f"{o['label']} (not published)" for o in c.bore_options)
+        side = "driver and driven shafts" if (not checks["driver_bore"] and not checks["driven_bore"]) else ("driver shaft" if not checks["driver_bore"] else "driven shaft")
+        return f"{c.name}: every documented hub configuration for this size was checked ({tried}) and none accommodates the requested {side}."
     if not checks["dbse"]:
         min_dbse = c.min_dbse_mm if native_unit == "mm" else c.min_dbse_in
         max_dbse = c.max_dbse_mm if native_unit == "mm" else c.max_dbse_in
@@ -434,10 +473,16 @@ def recommend(req: Request, db: Session = Depends(get_db)):
     for c in winners:
         checks = check_candidate(c, req, required_torque, native_unit, driver_native, driven_native, dbse_native)
         notes = qualification_notes(c, req, required_torque, native_unit, torque_unit_label, driver_native, driven_native, dbse_native)
+        if len(c.bore_options) > 1:
+            steps.append({"label": f"Hub Configuration Check - {c.name}",
+                          "detail": f"{c.name} was NOT rejected for a larger coupling size merely because its smallest hub "
+                                    f"might not fit - all {len(c.bore_options)} documented hub configurations "
+                                    f"({', '.join(o['label'] for o in c.bore_options)}) were checked before concluding this size works."})
         driver_hub = smallest_sufficient_bore_option(c, native_unit, driver_native)
         driven_hub = smallest_sufficient_bore_option(c, native_unit, driven_native)
         entry = out_coupling(c)
         entry["qualifies_because"] = notes
+        entry["hub_configuration"] = overall_hub_label(c, native_unit, driver_hub, driven_hub)
         entry["driver_bore_configuration"] = driver_hub
         entry["driven_bore_configuration"] = driven_hub
         optional_notes = []
