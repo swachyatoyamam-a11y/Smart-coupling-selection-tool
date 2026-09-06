@@ -1,29 +1,57 @@
-"""Smart Coupling Selection & Recommendation Tool API.
+"""Smart Coupling Selection & Recommendation Tool API - Phase 2.
 
-Coupling data in this file is transcribed directly from the Regal Rexnord
-Thomas Flexible Disc Couplings METRIC catalog (Catalog 2000M), covering the
-XTSR52 (non-adapter spacer) and XTSR71 (adapter spacer) series across their
-full published size range (494-5258). No values are estimated or invented:
-where the manual does not publish a figure (e.g. parallel misalignment or
-temperature ratings for these series), the field is left null and the API
-reports "Not specified in supplied manual" rather than guessing.
+Selection is grounded entirely in the Regal Rexnord Thomas Flexible Disc Coupling catalogs
+(see catalog_data.py for the transcribed source tables and their provenance). This module
+contains ONLY the selection engine and API surface; no catalog values are hardcoded here.
 
-Source pages: XTSR52 pp. 11-13, XTSR71 pp. 14-16 of Catalog 2000M.
+Core rules (approved Phase 2 spec):
+  1. kW power -> required torque is checked against the METRIC (2000M) catalog's
+     Max. Continuous Torque (N*m).
+  2. HP power -> required torque is checked against the IMPERIAL (Catalog 2000) catalog's
+     Max. Continuous Torque (lb*in). Torque is computed natively per unit (9550*kW/RPM or
+     63025*HP/RPM), never by converting HP to kW first.
+  3. Required torque = transmitted torque * a FIXED 1.5 service factor.
+  4. The candidate with the SMALLEST catalog torque rating >= required torque wins (not the
+     lightest, not the first found) - "next higher torque" rule.
+  5. Driver shaft, driven shaft and DBSE units are independently mm/in.
+  6. Power unit and dimensional units are completely independent of each other.
+  7. coupling_type ("spacer" | "closed_coupled") is a hard filter applied BEFORE any
+     engineering check - never a tie-break or a post-hoc classification.
+  8. For "spacer", XTSR52, XTSR71 and the legacy SERIES71 are all considered. XTSR71 and
+     SERIES71 are distinct catalog products (different size numbering, never merged); if
+     both have a size that qualifies at the same minimum sufficient torque, both are
+     returned as valid recommendations rather than one being silently dropped.
+  9. DBSE must fall inside the catalog's continuous Min C-Max C range where published.
+     SERIES71 does not publish a Max C - Std C is used as a conservative reference ceiling
+     and is flagged as such, never presented as an official catalog maximum.
+  10. Misalignment limits are read directly from catalog data; only angular is published for
+      the products in scope, so parallel is reported "not specified" rather than guessed.
+  11. No catalog in this project publishes a sub-zero / heat-treated-alloy-steel rating for
+      any product in scope. A requirement of temperature < -45C is therefore a hard
+      constraint that NO candidate can satisfy, and must return NO_VALID_RECOMMENDATION with
+      that explanation - never an assumed Series 71 / XTSR71 exception.
+  12. Nothing is invented: every displayed figure traces to a catalog field, or is reported
+      as "Not specified in supplied manual".
 """
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from sqlalchemy import Float, Integer, String, create_engine, select
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import JSON, Boolean, Float, Integer, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+import catalog_data
 
 DB_PATH = Path(__file__).parent / "database" / "couplings.db"
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-HP_TO_KW = 0.745699872
+
+IN_TO_MM = 25.4
 SERVICE_FACTOR = 1.5
+NOT_SPECIFIED = "Not specified in supplied manual"
+LOW_TEMP_THRESHOLD_C = -45
 
 
 class Base(DeclarativeBase):
@@ -33,25 +61,34 @@ class Base(DeclarativeBase):
 class Coupling(Base):
     __tablename__ = "couplings"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    series: Mapped[str] = mapped_column(String)
-    size: Mapped[int] = mapped_column(Integer)
+    product: Mapped[str] = mapped_column(String)
+    coupling_type: Mapped[str] = mapped_column(String)
+    size: Mapped[str] = mapped_column(String)
     name: Mapped[str] = mapped_column(String, unique=True)
     disc_pack_style: Mapped[str] = mapped_column(String)
     standard_balance: Mapped[str] = mapped_column(String)
-    angular_misalignment: Mapped[str] = mapped_column(String)
+    angular_misalignment_label: Mapped[str] = mapped_column(String)
     angular_misalignment_deg: Mapped[float] = mapped_column(Float)
     parallel_misalignment: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    axial_capacity_mm: Mapped[float] = mapped_column(Float)
-    max_continuous_torque_nm: Mapped[float] = mapped_column(Float)
-    peak_overload_torque_nm: Mapped[float] = mapped_column(Float)
-    std_hub_max_bore_mm: Mapped[float] = mapped_column(Float)
-    xl_hub_max_bore_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    xxl_hub_max_bore_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    min_dbse_mm: Mapped[float] = mapped_column(Float)
-    max_dbse_mm: Mapped[float] = mapped_column(Float)
-    max_speed_as_mfd_rpm: Mapped[float] = mapped_column(Float)
-    max_speed_balanced_rpm: Mapped[float] = mapped_column(Float)
-    weight_kg: Mapped[float] = mapped_column(Float)
+    bore_options: Mapped[list] = mapped_column(JSON)
+    min_dbse_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_dbse_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    min_dbse_in: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_dbse_in: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    dbse_max_documented: Mapped[bool] = mapped_column(Boolean, default=False)
+    dbse_is_variable: Mapped[bool] = mapped_column(Boolean, default=True)
+    fixed_c_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fixed_c_in: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_continuous_torque_nm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_continuous_torque_lbin: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    peak_overload_torque_nm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    peak_overload_torque_lbin: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_speed_as_mfd_rpm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_speed_balanced_rpm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    axial_capacity_mm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    axial_capacity_in: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    weight_kg: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    weight_lb: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     disc_pack_material: Mapped[str] = mapped_column(String)
     major_component_material: Mapped[str] = mapped_column(String)
     bolt_material: Mapped[str] = mapped_column(String)
@@ -59,119 +96,9 @@ class Coupling(Base):
     temperature_rating: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     api_compliance: Mapped[str] = mapped_column(String)
     typical_applications: Mapped[str] = mapped_column(String)
-    source_reference: Mapped[str] = mapped_column(String)
-
-    @property
-    def max_bore_available_mm(self) -> float:
-        return max(b for b in (self.std_hub_max_bore_mm, self.xl_hub_max_bore_mm, self.xxl_hub_max_bore_mm) if b)
-
-
-def angular_label(series: str, size: int) -> tuple[str, float]:
-    """Angular misalignment per disc pack, per Catalog 2000M 'General' box for XTSR52/XTSR71."""
-    if size in (494, 644):
-        return "2/3° per disc pack", 2 / 3
-    if size in (726, 826, 996):
-        return "1/2° per disc pack", 0.5
-    return "1/3° per disc pack", 1 / 3
-
-
-# (size, max_cont_torque_Nm, std_bore_mm, min_C_mm, max_C_mm, max_rpm_as_mfd, max_rpm_balanced, axial_mm, weight_kg)
-# Source: Catalog 2000M p.12 "XTSR52 Spacer Type Coupling - General Coupling Data"
-XTSR52_DATA = [
-    (494, 85, 27, 82, 163, 13800, 23000, 1.2, 0.88),
-    (644, 145, 38, 82, 239, 12500, 21500, 1.7, 1.35),
-    (726, 297, 45, 82, 373, 12000, 20000, 1.3, 1.77),
-    (826, 554, 50, 88, 374, 10900, 18500, 1.5, 3.34),
-    (996, 927, 60, 98, 781, 9800, 15000, 1.8, 4.78),
-    (1088, 2190, 65, 103, 783, 9000, 14000, 1.3, 8.34),
-    (1298, 3550, 80, 116, 788, 8000, 12000, 1.6, 13.6),
-    (1548, 5910, 95, 128, 792, 7100, 10000, 1.8, 20.8),
-    (1698, 8190, 105, 152, 794, 6600, 9100, 2.0, 29.0),
-    (1928, 11100, 120, 160, 796, 6100, 8500, 2.3, 38.2),
-    (2068, 15400, 130, 176, 799, 5800, 7800, 2.5, 49.9),
-    (2278, 19900, 140, 213, 800, 5500, 7100, 2.7, 69.7),
-    (2468, 26200, 150, 222, 803, 5200, 6500, 3.0, 87.3),
-    (2698, 35900, 165, 238, 1114, 4800, 6000, 3.2, 111),
-    (2888, 47000, 175, 270, 1117, 4600, 5700, 3.5, 150),
-    (3058, 52000, 185, 270, 1117, 4400, 5400, 3.7, 172),
-    (3358, 70200, 215, 302, 1121, 4200, 4700, 4.0, 232),
-    (3668, 94300, 225, 321, 1128, 3900, 4400, 4.4, 329),
-    (3908, 103000, 240, 321, 1128, 3800, 4100, 4.7, 381),
-    (4178, 128000, 255, 343, 1132, 3600, 3900, 5.0, 468),
-    (4588, 189000, 280, 498, 1037, 3400, 3600, 5.5, 661),
-    (4918, 235000, 300, 518, 1041, 3200, 3300, 5.9, 817),
-    (5258, 283000, 320, 540, 1046, 3100, 3100, 6.3, 991),
-]
-
-# (size, max_cont_torque_Nm, std_bore, xl_bore, xxl_bore, min_C_mm, max_C_mm, max_rpm_as_mfd, max_rpm_balanced, axial_mm, weight_kg)
-# Source: Catalog 2000M p.15 "XTSR71 Spacer Type Coupling with Adapters - General Coupling Data"
-XTSR71_DATA = [
-    (494, 85, 28, 38, 42, 65, 162, 13800, 23000, 1.2, 1.6),
-    (644, 145, 38, None, 52, 68, 266, 12500, 21500, 1.7, 2.5),
-    (726, 297, 42, 52, 61, 65, 398, 12000, 20000, 1.3, 3.1),
-    (826, 554, 52, 61, 76, 77, 404, 10900, 18500, 1.5, 5.0),
-    (996, 927, 61, 76, 90, 92, 819, 9800, 15000, 1.8, 8.4),
-    (1088, 2190, 76, 90, 105, 96, 821, 9000, 14000, 1.3, 12.5),
-    (1298, 3550, 90, 105, 125, 115, 834, 8000, 12000, 1.6, 20.6),
-    (1548, 5910, 105, 125, 135, 135, 846, 7100, 10000, 1.8, 34.6),
-    (1698, 8190, 125, 135, 150, 151, 856, 6600, 9100, 2.0, 47.0),
-    (1928, 11100, 135, 150, 155, 161, 861, 6100, 8500, 2.3, 62.7),
-    (2068, 15400, 150, 155, 166, 187, 877, 5800, 7800, 2.5, 84.9),
-    (2278, 19900, 155, 166, 200, 196, 881, 5500, 7100, 2.7, 110),
-    (2468, 26200, 166, 200, 220, 209, 889, 5200, 6500, 3.0, 143),
-    (2698, 35900, 200, 220, 235, 236, 1211, 4800, 6000, 3.2, 184),
-    (2888, 47000, 220, 235, 260, 255, 1221, 4600, 5700, 3.5, 257),
-    (3058, 52000, 235, 260, 285, 257, 1222, 4400, 5400, 3.7, 274),
-    (3358, 70200, 260, 285, 310, 287, 1239, 4200, 4700, 4.0, 366),
-    (3668, 94300, 285, 310, 330, 310, 1254, 3900, 4400, 4.4, 521),
-    (3908, 103000, 310, 330, 360, 311, 1255, 3800, 4100, 4.7, 536),
-    (4178, 128000, 330, 360, 400, 340, 1272, 3600, 3900, 5.0, 648),
-    (4588, 189000, 360, 400, 430, 386, 1197, 3400, 3600, 5.5, 993),
-    (4918, 235000, 400, 430, None, 408, 1209, 3200, 3300, 5.9, 1200),
-    (5258, 283000, 430, None, None, 438, 1227, 3100, 3100, 6.3, 1420),
-]
-
-XTSR52_APPS = "Pumps and compressors (centrifugal, rotary, lobe and axial), speed increasers, fans, dynamometers."
-XTSR71_APPS = "Pumps and compressors with popular shaft separation standards, blowers, fans, speed increasers."
-XTSR52_API = "API 610, ISO 14691 compliant when specified; ATEX II 2GD c T6 certified."
-XTSR71_API = "API 610 / ISO 14691 compliant as standard; API 671 (ISO 10441) compliant when specified; ATEX II 2GD c T6 certified."
-
-
-def build_seed():
-    rows = []
-    for size, torque, bore, cmin, cmax, rpm_mfd, rpm_bal, axial, weight in XTSR52_DATA:
-        label, deg = angular_label("XTSR52", size)
-        rows.append(dict(
-            series="XTSR52", size=size, name=f"XTSR52-{size}",
-            disc_pack_style="Unitized XTSR", standard_balance="AGMA Class 9",
-            angular_misalignment=label, angular_misalignment_deg=deg,
-            parallel_misalignment=None, axial_capacity_mm=axial,
-            max_continuous_torque_nm=torque, peak_overload_torque_nm=torque * 2,
-            std_hub_max_bore_mm=bore, xl_hub_max_bore_mm=None, xxl_hub_max_bore_mm=None,
-            min_dbse_mm=cmin, max_dbse_mm=cmax,
-            max_speed_as_mfd_rpm=rpm_mfd, max_speed_balanced_rpm=rpm_bal, weight_kg=weight,
-            disc_pack_material="Stainless steel", major_component_material="Carbon steel",
-            bolt_material="Alloy steel", coating="Manganese phosphate (other coatings available on request)",
-            temperature_rating=None, api_compliance=XTSR52_API, typical_applications=XTSR52_APPS,
-            source_reference="Regal Rexnord Thomas Flexible Disc Couplings, Catalog 2000M, XTSR52 Spacer Type Coupling, pp. 11-13",
-        ))
-    for size, torque, bore, xl, xxl, cmin, cmax, rpm_mfd, rpm_bal, axial, weight in XTSR71_DATA:
-        label, deg = angular_label("XTSR71", size)
-        rows.append(dict(
-            series="XTSR71", size=size, name=f"XTSR71-{size}",
-            disc_pack_style="Unitized XTSR", standard_balance="AGMA Class 9",
-            angular_misalignment=label, angular_misalignment_deg=deg,
-            parallel_misalignment=None, axial_capacity_mm=axial,
-            max_continuous_torque_nm=torque, peak_overload_torque_nm=torque * 2,
-            std_hub_max_bore_mm=bore, xl_hub_max_bore_mm=xl, xxl_hub_max_bore_mm=xxl,
-            min_dbse_mm=cmin, max_dbse_mm=cmax,
-            max_speed_as_mfd_rpm=rpm_mfd, max_speed_balanced_rpm=rpm_bal, weight_kg=weight,
-            disc_pack_material="Stainless steel", major_component_material="Carbon steel",
-            bolt_material="Alloy steel", coating=None,
-            temperature_rating=None, api_compliance=XTSR71_API, typical_applications=XTSR71_APPS,
-            source_reference="Regal Rexnord Thomas Flexible Disc Couplings, Catalog 2000M, XTSR71 Spacer Type Coupling with Adapters, pp. 14-16",
-        ))
-    return rows
+    source_reference_metric: Mapped[str] = mapped_column(String)
+    source_reference_imperial: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    imperial_not_published: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 def get_db():
@@ -182,19 +109,11 @@ def get_db():
         db.close()
 
 
-def out(c: Coupling) -> dict:
-    d = {k: getattr(c, k) for k in Coupling.__table__.columns.keys()}
-    d["parallel_misalignment"] = c.parallel_misalignment or "Not specified in supplied manual"
-    d["temperature_rating"] = c.temperature_rating or "Not specified in supplied manual"
-    d["max_bore_available_mm"] = c.max_bore_available_mm
-    return d
-
-
 def seed():
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         if db.scalar(select(Coupling.id).limit(1)) is None:
-            for row in build_seed():
+            for row in catalog_data.build_rows():
                 db.add(Coupling(**row))
             db.commit()
 
@@ -205,8 +124,53 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Smart Coupling API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Smart Coupling API", version="4.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ---------------------------------------------------------------------------
+# Unit helpers
+# ---------------------------------------------------------------------------
+def convert_length(value: float, from_unit: str, to_unit: str) -> float:
+    if from_unit == to_unit:
+        return value
+    return value * IN_TO_MM if from_unit == "in" else value / IN_TO_MM
+
+
+def native_unit_for(power_unit: str) -> str:
+    """The dimensional unit system whose catalog is authoritative for the chosen power unit."""
+    return "mm" if power_unit == "kW" else "in"
+
+
+def transmitted_torque(power: float, power_unit: str, speed: float) -> tuple[float, str]:
+    if power_unit == "kW":
+        return 9550 * power / speed, "N·m"
+    return 63025 * power / speed, "lb·in"
+
+
+def out_coupling(c: Coupling) -> dict:
+    return {
+        "id": c.id, "product": c.product, "coupling_type": c.coupling_type, "size": c.size, "name": c.name,
+        "disc_pack_style": c.disc_pack_style, "standard_balance": c.standard_balance,
+        "angular_misalignment_label": c.angular_misalignment_label, "angular_misalignment_deg": c.angular_misalignment_deg,
+        "parallel_misalignment": c.parallel_misalignment or NOT_SPECIFIED,
+        "bore_options": c.bore_options,
+        "min_dbse_mm": c.min_dbse_mm, "max_dbse_mm": c.max_dbse_mm,
+        "min_dbse_in": c.min_dbse_in, "max_dbse_in": c.max_dbse_in,
+        "dbse_max_documented": c.dbse_max_documented, "dbse_is_variable": c.dbse_is_variable,
+        "max_continuous_torque_nm": c.max_continuous_torque_nm, "max_continuous_torque_lbin": c.max_continuous_torque_lbin,
+        "peak_overload_torque_nm": c.peak_overload_torque_nm, "peak_overload_torque_lbin": c.peak_overload_torque_lbin,
+        "max_speed_as_mfd_rpm": c.max_speed_as_mfd_rpm, "max_speed_balanced_rpm": c.max_speed_balanced_rpm,
+        "axial_capacity_mm": c.axial_capacity_mm, "axial_capacity_in": c.axial_capacity_in,
+        "weight_kg": c.weight_kg, "weight_lb": c.weight_lb,
+        "disc_pack_material": c.disc_pack_material, "major_component_material": c.major_component_material,
+        "bolt_material": c.bolt_material, "coating": c.coating or NOT_SPECIFIED,
+        "temperature_rating": c.temperature_rating or NOT_SPECIFIED,
+        "api_compliance": c.api_compliance, "typical_applications": c.typical_applications,
+        "source_reference_metric": c.source_reference_metric,
+        "source_reference_imperial": c.source_reference_imperial or NOT_SPECIFIED,
+        "imperial_not_published": c.imperial_not_published,
+    }
 
 
 class TorqueInput(BaseModel):
@@ -215,19 +179,27 @@ class TorqueInput(BaseModel):
     speed: float = Field(gt=0)
 
 
-def transmitted_torque_nm(power: float, power_unit: str, speed: float) -> float:
-    kw = power if power_unit == "kW" else power * HP_TO_KW
-    return 9550 * kw / speed
+@app.post("/calculate-torque")
+def torque(data: TorqueInput):
+    value, unit = transmitted_torque(data.power, data.power_unit, data.speed)
+    return {"torque": round(value, 2), "unit": unit,
+            "formula": "9550 × Power(kW) ÷ Speed(RPM)" if data.power_unit == "kW" else "63025 × Power(HP) ÷ Speed(RPM)"}
 
 
 class Request(BaseModel):
-    driver_shaft_mm: float = Field(gt=0)
-    driven_shaft_mm: float = Field(gt=0)
-    dbse_mm: float = Field(gt=0)
+    coupling_type: Literal["spacer", "closed_coupled"]
+    driver_shaft: float = Field(gt=0)
+    driver_shaft_unit: Literal["mm", "in"]
+    driven_shaft: float = Field(gt=0)
+    driven_shaft_unit: Literal["mm", "in"]
+    dbse: Optional[float] = Field(default=None, gt=0)
+    dbse_unit: Optional[Literal["mm", "in"]] = None
     power: float = Field(gt=0)
     power_unit: Literal["kW", "HP"]
     speed: float = Field(gt=0)
-    # Operating conditions are all optional and never used to reject a candidate.
+    # Operating conditions are optional. Only the sub -45C temperature case is a hard
+    # constraint (Part I); everything else here is reported for context only, per what the
+    # supplied catalogs do and do not publish for the products in scope.
     temperature_c: Optional[float] = None
     hours_per_day: Optional[float] = Field(default=None, gt=0)
     service_life_years: Optional[float] = Field(default=None, gt=0)
@@ -239,6 +211,13 @@ class Request(BaseModel):
     precision: bool = False
     vibration_damping: bool = False
     soft_start: bool = False
+
+    @model_validator(mode="after")
+    def _dbse_required_for_spacer(self):
+        if self.coupling_type == "spacer":
+            if self.dbse is None or self.dbse_unit is None:
+                raise ValueError("dbse and dbse_unit are required when coupling_type is 'spacer'")
+        return self
 
 
 class CompareInput(BaseModel):
@@ -252,7 +231,7 @@ def health():
 
 @app.get("/couplings")
 def couplings(db: Session = Depends(get_db)):
-    return [out(c) for c in db.scalars(select(Coupling).order_by(Coupling.series, Coupling.size))]
+    return [out_coupling(c) for c in db.scalars(select(Coupling).order_by(Coupling.coupling_type, Coupling.product, Coupling.id))]
 
 
 @app.get("/couplings/{coupling_id}")
@@ -260,14 +239,7 @@ def coupling(coupling_id: int, db: Session = Depends(get_db)):
     c = db.get(Coupling, coupling_id)
     if not c:
         raise HTTPException(404, "Coupling not found")
-    return out(c)
-
-
-@app.post("/calculate-torque")
-def torque(data: TorqueInput):
-    t = transmitted_torque_nm(data.power, data.power_unit, data.speed)
-    kw = data.power if data.power_unit == "kW" else data.power * HP_TO_KW
-    return {"torque_nm": round(t, 2), "kw": round(kw, 3), "formula": "9550 × Power (kW) ÷ Speed (RPM)"}
+    return out_coupling(c)
 
 
 @app.post("/compare")
@@ -275,127 +247,237 @@ def compare(data: CompareInput, db: Session = Depends(get_db)):
     items = [db.get(Coupling, i) for i in data.coupling_ids]
     if not all(items):
         raise HTTPException(404, "One or more couplings were not found")
-    return [out(c) for c in items]
+    return [out_coupling(c) for c in items]
 
 
-def check(c: Coupling, req: Request, required_torque: float):
-    return {
-        "torque": required_torque <= c.max_continuous_torque_nm,
-        "driver_bore": req.driver_shaft_mm <= c.max_bore_available_mm,
-        "driven_bore": req.driven_shaft_mm <= c.max_bore_available_mm,
-        "dbse": c.min_dbse_mm <= req.dbse_mm <= c.max_dbse_mm,
-        "speed": req.speed <= c.max_speed_as_mfd_rpm,
+# ---------------------------------------------------------------------------
+# Selection engine
+# ---------------------------------------------------------------------------
+def best_bore_mm_or_in(c: Coupling, native_unit: str) -> Optional[float]:
+    key = "max_bore_mm" if native_unit == "mm" else "max_bore_in"
+    values = [o.get(key) for o in c.bore_options if o.get(key) is not None]
+    return max(values) if values else None
+
+
+def smallest_sufficient_bore_option(c: Coupling, native_unit: str, required: float) -> Optional[dict]:
+    key = "max_bore_mm" if native_unit == "mm" else "max_bore_in"
+    fitting = [o for o in c.bore_options if o.get(key) is not None and o[key] >= required]
+    if not fitting:
+        return None
+    return min(fitting, key=lambda o: o[key])
+
+
+def torque_rating(c: Coupling, native_unit: str) -> Optional[float]:
+    return c.max_continuous_torque_nm if native_unit == "mm" else c.max_continuous_torque_lbin
+
+
+def check_candidate(c: Coupling, req: Request, required_torque: float, native_unit: str,
+                     driver_native: float, driven_native: float, dbse_native: Optional[float]) -> dict:
+    rating = torque_rating(c, native_unit)
+    best_bore = best_bore_mm_or_in(c, native_unit)
+    result = {
+        "torque": rating is not None and rating >= required_torque,
+        "driver_bore": best_bore is not None and driver_native <= best_bore,
+        "driven_bore": best_bore is not None and driven_native <= best_bore,
+        "speed": c.max_speed_as_mfd_rpm is not None and req.speed <= c.max_speed_as_mfd_rpm,
+        "temperature": True,
     }
+    if c.coupling_type == "spacer":
+        min_dbse = c.min_dbse_mm if native_unit == "mm" else c.min_dbse_in
+        max_dbse = c.max_dbse_mm if native_unit == "mm" else c.max_dbse_in
+        result["dbse"] = (min_dbse is not None and max_dbse is not None and dbse_native is not None
+                           and min_dbse <= dbse_native <= max_dbse)
+    else:
+        result["dbse"] = True  # closed-coupled: no user-adjustable DBSE in this catalog data
+    if req.temperature_c is not None and req.temperature_c < LOW_TEMP_THRESHOLD_C:
+        result["temperature"] = False  # no catalog in this project supports sub -45C service for any product in scope
+    return result
+
+
+def qualification_notes(c: Coupling, req: Request, required_torque: float, native_unit: str, torque_unit_label: str,
+                         driver_native: float, driven_native: float, dbse_native: Optional[float]) -> list[str]:
+    rating = torque_rating(c, native_unit)
+    best_bore = best_bore_mm_or_in(c, native_unit)
+    dim_unit = native_unit
+    notes = [
+        f"{c.name} rated {rating:,.0f} {torque_unit_label} continuous ≥ {required_torque:,.1f} {torque_unit_label} required.",
+        f"Driver ({driver_native:.2f} {dim_unit}) and driven ({driven_native:.2f} {dim_unit}) shafts both fit within the "
+        f"{best_bore:.2f} {dim_unit} maximum bore published for this size.",
+    ]
+    if c.coupling_type == "spacer" and dbse_native is not None:
+        min_dbse = c.min_dbse_mm if native_unit == "mm" else c.min_dbse_in
+        max_dbse = c.max_dbse_mm if native_unit == "mm" else c.max_dbse_in
+        ceiling_note = "" if c.dbse_max_documented else " (Std. C used as a reference ceiling - the catalog does not publish a Max. C for this product)"
+        notes.append(f"Requested DBSE {dbse_native:.2f} {dim_unit} falls within the published range "
+                      f"{min_dbse:.2f}–{max_dbse:.2f} {dim_unit}{ceiling_note}.")
+    if c.max_speed_as_mfd_rpm is not None:
+        notes.append(f"Operating speed {req.speed:.0f} RPM ≤ Max. Speed (As Manufactured) {c.max_speed_as_mfd_rpm:,.0f} RPM.")
+    return notes
+
+
+def rejection_reason(c: Coupling, checks: dict, native_unit: str, torque_unit_label: str, required_torque: float) -> str:
+    rating = torque_rating(c, native_unit)
+    if not checks["torque"]:
+        if rating is None:
+            return f"{c.name}: continuous torque rating is not published in the {'Imperial' if native_unit == 'in' else 'Metric'} catalog for this size."
+        return f"{c.name}: rated {rating:,.0f} {torque_unit_label} continuous < {required_torque:,.1f} {torque_unit_label} required."
+    if not checks["driver_bore"] or not checks["driven_bore"]:
+        best_bore = best_bore_mm_or_in(c, native_unit)
+        return f"{c.name}: maximum available bore ({best_bore:.2f} {native_unit} if published) cannot accommodate the requested shaft diameter(s)."
+    if not checks["dbse"]:
+        min_dbse = c.min_dbse_mm if native_unit == "mm" else c.min_dbse_in
+        max_dbse = c.max_dbse_mm if native_unit == "mm" else c.max_dbse_in
+        if min_dbse is None:
+            return f"{c.name}: no DBSE range published for this size."
+        return f"{c.name}: requested DBSE is outside the published range {min_dbse:.2f}–{max_dbse:.2f} {native_unit}."
+    if not checks["speed"]:
+        return f"{c.name}: requested speed exceeds the published Max. Speed (As Manufactured)."
+    if not checks["temperature"]:
+        return (f"{c.name}: a temperature below {LOW_TEMP_THRESHOLD_C}°C was requested, but no coupling in the supplied "
+                f"Regal Rexnord Thomas catalogs (metric or imperial) publishes a low-temperature or heat-treated-alloy-steel "
+                f"rating for any product in scope - this is not supported, not assumed.")
+    return f"{c.name}: does not satisfy all mandatory constraints."
 
 
 @app.post("/recommend")
 def recommend(req: Request, db: Session = Depends(get_db)):
-    all_couplings = list(db.scalars(select(Coupling).order_by(Coupling.series, Coupling.size)))
-    required_torque = transmitted_torque_nm(req.power, req.power_unit, req.speed) * SERVICE_FACTOR
-    transmitted = required_torque / SERVICE_FACTOR
+    native_unit = native_unit_for(req.power_unit)
+    torque_unit_label = "N·m" if native_unit == "mm" else "lb·in"
+    transmitted, _ = transmitted_torque(req.power, req.power_unit, req.speed)
+    required_torque = transmitted * SERVICE_FACTOR
 
-    evaluated = [(c, check(c, req, required_torque)) for c in all_couplings]
+    driver_native = convert_length(req.driver_shaft, req.driver_shaft_unit, native_unit)
+    driven_native = convert_length(req.driven_shaft, req.driven_shaft_unit, native_unit)
+    dbse_native = convert_length(req.dbse, req.dbse_unit, native_unit) if req.dbse is not None else None
+
+    pool = list(db.scalars(select(Coupling).where(Coupling.coupling_type == req.coupling_type).order_by(Coupling.product, Coupling.id)))
+    evaluated = [(c, check_candidate(c, req, required_torque, native_unit, driver_native, driven_native, dbse_native)) for c in pool]
     candidates = [c for c, r in evaluated if all(r.values())]
 
     steps = [
         {"label": "Power → Speed → Transmitted Torque",
-         "detail": f"{req.power} {req.power_unit} at {req.speed} RPM → {transmitted:.1f} N·m (Torque = 9550 × Power[kW] ÷ Speed[RPM])"},
-        {"label": "Service Factor", "detail": f"Fixed service factor of {SERVICE_FACTOR} applied to transmitted torque."},
-        {"label": "Required Torque", "detail": f"{transmitted:.1f} N·m × {SERVICE_FACTOR} = {required_torque:.1f} N·m required coupling rating."},
+         "detail": f"{req.power} {req.power_unit} at {req.speed} RPM → {transmitted:,.1f} {torque_unit_label} "
+                   f"({'9550 × Power[kW] ÷ Speed[RPM]' if req.power_unit == 'kW' else '63025 × Power[HP] ÷ Speed[RPM]'})"},
+        {"label": "Service Factor", "detail": f"Fixed service factor of {SERVICE_FACTOR} applied to transmitted torque (not user-adjustable)."},
+        {"label": "Required Torque", "detail": f"{transmitted:,.1f} × {SERVICE_FACTOR} = {required_torque:,.1f} {torque_unit_label} required coupling rating."},
+        {"label": "Torque Catalog", "detail": f"{'Catalog 2000M (Metric)' if native_unit == 'mm' else 'Catalog 2000 (Imperial)'} "
+                                               f"Maximum Continuous Torque is authoritative for a {req.power_unit} power input."},
+        {"label": "Coupling Type Filter", "detail": f"Restricted to catalog products documented as \"{req.coupling_type.replace('_', '-')}\" "
+                                                      f"before any engineering check was applied ({len(pool)} candidate sizes considered)."},
     ]
 
-    if not candidates:
-        diag = {
-            "torque_pass": sum(1 for _, r in evaluated if r["torque"]),
-            "bore_pass": sum(1 for _, r in evaluated if r["driver_bore"] and r["driven_bore"]),
-            "dbse_pass": sum(1 for _, r in evaluated if r["dbse"]),
-            "speed_pass": sum(1 for _, r in evaluated if r["speed"]),
-            "total": len(evaluated),
-        }
-        largest_bore = max(c.max_bore_available_mm for c in all_couplings)
-        largest_torque = max(c.max_continuous_torque_nm for c in all_couplings)
-        max_dbse = max(c.max_dbse_mm for c in all_couplings)
-        min_dbse_overall = min(c.min_dbse_mm for c in all_couplings)
-        notes = []
-        if diag["torque_pass"] == 0:
-            notes.append(f"Required torque {required_torque:.0f} N·m exceeds the largest coupling in this library ({largest_torque:.0f} N·m, XTSR52/71-5258).")
-        if diag["bore_pass"] == 0:
-            notes.append(f"A shaft of {max(req.driver_shaft_mm, req.driven_shaft_mm)} mm exceeds the largest available bore in this library ({largest_bore} mm, XTSR71-5258 XXL hub).")
-        if diag["dbse_pass"] == 0:
-            notes.append(f"DBSE {req.dbse_mm} mm is outside every published Min C/Max C range in this library ({min_dbse_overall}-{max_dbse} mm).")
-        if diag["speed_pass"] == 0:
-            notes.append(f"Speed {req.speed} RPM exceeds the Max RPM (As Manufactured) rating of every coupling in this library.")
-        return {
-            "feasible": False,
-            "transmitted_torque_nm": round(transmitted, 1),
-            "required_torque_nm": round(required_torque, 1),
-            "service_factor": SERVICE_FACTOR,
-            "selection_steps": steps,
-            "diagnostics": diag,
-            "reasoning": notes or ["No coupling in the currently loaded manual data (XTSR52/XTSR71 series) satisfies all constraints simultaneously."],
-            "recommendation": None,
-            "alternatives": [],
-        }
-
-    candidates.sort(key=lambda c: c.weight_kg)
-    winner = candidates[0]
-    alternatives = candidates[1:4]
-
-    steps += [
-        {"label": "Torque Capacity Check", "detail": f"{winner.name}: rated {winner.max_continuous_torque_nm:.0f} N·m continuous ≥ {required_torque:.1f} N·m required → PASS"},
-        {"label": "Shaft / Bore Check", "detail": f"Driver {req.driver_shaft_mm} mm and driven {req.driven_shaft_mm} mm ≤ max available bore {winner.max_bore_available_mm:.0f} mm → PASS"},
-        {"label": "DBSE Check", "detail": f"DBSE {req.dbse_mm} mm within published range {winner.min_dbse_mm:.0f}-{winner.max_dbse_mm:.0f} mm → PASS"},
-        {"label": "Speed Check", "detail": f"{req.speed} RPM ≤ Max RPM As Manufactured {winner.max_speed_as_mfd_rpm:.0f} → PASS"},
-    ]
-
-    reasoning = [
-        f"{winner.name} torque capacity ({winner.max_continuous_torque_nm:.0f} N·m) meets the {SERVICE_FACTOR}× service-factor-adjusted requirement of {required_torque:.1f} N·m.",
-        f"Both driver ({req.driver_shaft_mm} mm) and driven ({req.driven_shaft_mm} mm) shafts fit within the {winner.max_bore_available_mm:.0f} mm maximum bore published for this size.",
-        f"Requested DBSE of {req.dbse_mm} mm falls within the manual's published Min C / Max C range ({winner.min_dbse_mm:.0f}-{winner.max_dbse_mm:.0f} mm) for {winner.name}.",
-        f"Selected as the lightest ({winner.weight_kg} kg) of {len(candidates)} coupling(s) in the library that satisfy every hard constraint.",
-    ]
-
-    optional_notes = []
-    if req.temperature_c is not None:
-        optional_notes.append(f"Temperature requirement ({req.temperature_c}°C) → Not specified in supplied manual for the {winner.series} series; no coupling series in the currently loaded catalog data publishes a temperature rating applicable here.")
-    if req.required_angular_misalignment_deg is not None:
-        satisfied = req.required_angular_misalignment_deg <= winner.angular_misalignment_deg
-        optional_notes.append(f"Angular misalignment requirement: {req.required_angular_misalignment_deg}° vs. allowable {winner.angular_misalignment} → {'meets' if satisfied else 'EXCEEDS'} the manual-rated capacity.")
-    if req.required_parallel_misalignment_mm is not None:
-        optional_notes.append(f"Parallel misalignment requirement: {req.required_parallel_misalignment_mm} mm vs. allowable: Not specified in supplied manual for {winner.series} (only angular misalignment per disc pack is published for this series).")
-    for label, val in (("Shock load", req.shock_load), ("Environment", req.environment), ("Budget", req.budget)):
-        if val:
-            optional_notes.append(f"{label} ({val}) noted, but the supplied manual does not publish a per-coupling rating for this attribute in the XTSR52/XTSR71 series, so it was not used to filter or score candidates.")
-    for label, flag in (("High precision", req.precision), ("Vibration damping", req.vibration_damping), ("Soft starting", req.soft_start)):
-        if flag:
-            optional_notes.append(f"{label} was requested, but the supplied manual does not differentiate XTSR52/XTSR71 sizes on this attribute, so it did not affect the selection.")
-
-    steps.append({"label": "Optional Operating-Condition Checks", "detail": "; ".join(optional_notes) if optional_notes else "None provided — recommendation based on mechanical/dimensional requirements only."})
-    steps.append({"label": "Final Recommendation", "detail": f"{winner.name} selected."})
-
-    misalignment_comparison = {
-        "angular": {
-            "required_deg": req.required_angular_misalignment_deg,
-            "allowable": winner.angular_misalignment,
-            "allowable_deg": winner.angular_misalignment_deg,
-            "satisfied": (req.required_angular_misalignment_deg <= winner.angular_misalignment_deg) if req.required_angular_misalignment_deg is not None else None,
-        },
-        "parallel": {
-            "required_mm": req.required_parallel_misalignment_mm,
-            "allowable": "Not specified in supplied manual",
-            "satisfied": None,
-        },
-        "axial": {"allowable_mm": winner.axial_capacity_mm},
+    diag = {
+        "torque_pass": sum(1 for _, r in evaluated if r["torque"]),
+        "bore_pass": sum(1 for _, r in evaluated if r["driver_bore"] and r["driven_bore"]),
+        "dbse_pass": sum(1 for _, r in evaluated if r["dbse"]),
+        "speed_pass": sum(1 for _, r in evaluated if r["speed"]),
+        "temperature_pass": sum(1 for _, r in evaluated if r["temperature"]),
+        "total": len(evaluated),
     }
 
+    # Per-product summary: which product families in this pool had at least one qualifying size.
+    products_in_pool = sorted({c.product for c in pool})
+    product_summary = []
+    for prod in products_in_pool:
+        prod_rows = [(c, r) for c, r in evaluated if c.product == prod]
+        prod_candidates = [c for c, r in prod_rows if all(r.values())]
+        if prod_candidates:
+            best = min(prod_candidates, key=lambda c: torque_rating(c, native_unit))
+            product_summary.append({"product": prod, "status": "valid", "best_size": best.name, "reason": None})
+        else:
+            # Report why the largest (best-attempt) candidate for this product failed.
+            closest = min(prod_rows, key=lambda cr: (torque_rating(cr[0], native_unit) is None, -(torque_rating(cr[0], native_unit) or 0)))
+            product_summary.append({"product": prod, "status": "rejected",
+                                     "best_size": None,
+                                     "reason": rejection_reason(closest[0], closest[1], native_unit, torque_unit_label, required_torque)})
+
+    if not candidates:
+        notes = []
+        if diag["temperature_pass"] == 0:
+            notes.append(f"A temperature below {LOW_TEMP_THRESHOLD_C}°C was requested. No coupling in the supplied Regal Rexnord "
+                          f"Thomas catalogs (metric or imperial) publishes a low-temperature or heat-treated-alloy-steel rating for any "
+                          f"{req.coupling_type.replace('_', '-')} product in scope, so this cannot be satisfied.")
+        if diag["torque_pass"] == 0:
+            notes.append(f"Required torque {required_torque:,.0f} {torque_unit_label} exceeds every {req.coupling_type.replace('_', '-')} "
+                         f"coupling currently loaded for the {'Metric' if native_unit == 'mm' else 'Imperial'} catalog.")
+        if diag["bore_pass"] == 0:
+            notes.append("The requested driver/driven shaft diameter exceeds the largest published bore for every candidate in this pool.")
+        if diag["dbse_pass"] == 0 and req.coupling_type == "spacer":
+            notes.append("The requested DBSE falls outside every published Min C–Max C (or Std. C reference) range in this pool.")
+        if diag["speed_pass"] == 0:
+            notes.append("The requested speed exceeds the published Max. Speed (As Manufactured) for every candidate in this pool.")
+        return {
+            "feasible": False, "coupling_type": req.coupling_type,
+            "torque_catalog": "Catalog 2000M (Metric)" if native_unit == "mm" else "Catalog 2000 (Imperial)",
+            "transmitted_torque": {"value": round(transmitted, 1), "unit": torque_unit_label},
+            "required_torque": {"value": round(required_torque, 1), "unit": torque_unit_label},
+            "service_factor": SERVICE_FACTOR,
+            "selection_steps": steps, "diagnostics": diag, "product_summary": product_summary,
+            "reasoning": notes or ["No coupling in the currently loaded catalog data satisfies all constraints simultaneously."],
+            "valid_recommendations": [], "alternatives": [],
+        }
+
+    min_torque = min(torque_rating(c, native_unit) for c in candidates)
+    winners = sorted([c for c in candidates if torque_rating(c, native_unit) == min_torque],
+                      key=lambda c: (c.weight_kg if c.weight_kg is not None else float("inf")))
+    remaining = sorted([c for c in candidates if c not in winners], key=lambda c: torque_rating(c, native_unit))[:4]
+
+    steps.append({"label": "Next-Higher-Torque Selection",
+                  "detail": f"Smallest catalog rating ≥ {required_torque:,.1f} {torque_unit_label} is {min_torque:,.0f} {torque_unit_label}, "
+                            f"met by {', '.join(c.name for c in winners)}."})
+    if len(winners) > 1:
+        steps.append({"label": "Cross-Product Tie", "detail": f"{len(winners)} distinct catalog products ({', '.join(sorted({c.product for c in winners}))}) "
+                                                                 f"qualify at the identical minimum sufficient torque rating - all are returned rather than "
+                                                                 f"arbitrarily eliminating one."})
+
+    valid_recommendations = []
+    for c in winners:
+        checks = check_candidate(c, req, required_torque, native_unit, driver_native, driven_native, dbse_native)
+        notes = qualification_notes(c, req, required_torque, native_unit, torque_unit_label, driver_native, driven_native, dbse_native)
+        driver_hub = smallest_sufficient_bore_option(c, native_unit, driver_native)
+        driven_hub = smallest_sufficient_bore_option(c, native_unit, driven_native)
+        entry = out_coupling(c)
+        entry["qualifies_because"] = notes
+        entry["driver_bore_configuration"] = driver_hub
+        entry["driven_bore_configuration"] = driven_hub
+        optional_notes = []
+        if req.temperature_c is not None:
+            optional_notes.append(f"Temperature requirement ({req.temperature_c}°C) → {NOT_SPECIFIED} for {c.product}; "
+                                   f"no product in scope publishes a temperature rating applicable here.")
+        if req.required_angular_misalignment_deg is not None:
+            satisfied = req.required_angular_misalignment_deg <= c.angular_misalignment_deg
+            optional_notes.append(f"Angular misalignment requirement: {req.required_angular_misalignment_deg}° vs. allowable "
+                                   f"{c.angular_misalignment_label} → {'meets' if satisfied else 'EXCEEDS'} the manual-rated capacity.")
+        if req.required_parallel_misalignment_mm is not None:
+            optional_notes.append(f"Parallel misalignment requirement: {req.required_parallel_misalignment_mm} mm vs. allowable: "
+                                   f"{NOT_SPECIFIED} for {c.product} (only angular misalignment per disc pack is published).")
+        for label, val in (("Shock load", req.shock_load), ("Environment", req.environment), ("Budget", req.budget)):
+            if val:
+                optional_notes.append(f"{label} ({val}) noted, but not used to filter or score candidates - not a catalog-published rating for this attribute.")
+        entry["optional_condition_notes"] = optional_notes
+        entry["misalignment_comparison"] = {
+            "angular": {
+                "required_deg": req.required_angular_misalignment_deg,
+                "allowable_label": c.angular_misalignment_label, "allowable_deg": c.angular_misalignment_deg,
+                "satisfied": (req.required_angular_misalignment_deg <= c.angular_misalignment_deg) if req.required_angular_misalignment_deg is not None else None,
+            },
+            "parallel": {"required_mm": req.required_parallel_misalignment_mm, "allowable": NOT_SPECIFIED, "satisfied": None},
+            "axial": {"allowable_mm": c.axial_capacity_mm, "allowable_in": c.axial_capacity_in},
+        }
+        valid_recommendations.append(entry)
+
+    steps.append({"label": "Final Recommendation(s)", "detail": ", ".join(c.name for c in winners) + " selected."})
+
     return {
-        "feasible": True,
-        "transmitted_torque_nm": round(transmitted, 1),
-        "required_torque_nm": round(required_torque, 1),
+        "feasible": True, "coupling_type": req.coupling_type,
+        "torque_catalog": "Catalog 2000M (Metric)" if native_unit == "mm" else "Catalog 2000 (Imperial)",
+        "transmitted_torque": {"value": round(transmitted, 1), "unit": torque_unit_label},
+        "required_torque": {"value": round(required_torque, 1), "unit": torque_unit_label},
         "service_factor": SERVICE_FACTOR,
-        "recommendation": out(winner),
+        "valid_recommendations": valid_recommendations,
+        "alternatives": [out_coupling(c) for c in remaining],
+        "product_summary": product_summary,
         "selection_steps": steps,
-        "reasoning": reasoning + optional_notes,
-        "misalignment_comparison": misalignment_comparison,
-        "alternatives": [out(c) for c in alternatives],
+        "reasoning": [f"{len(winners)} candidate(s) share the minimum sufficient torque rating of {min_torque:,.0f} {torque_unit_label}."] +
+                     (["Distinct catalog products at that rating are all shown per instruction - none eliminated by weight."] if len(winners) > 1 else []),
     }
