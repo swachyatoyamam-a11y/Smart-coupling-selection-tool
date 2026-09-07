@@ -33,6 +33,7 @@ Core rules (approved Phase 2 spec):
   12. Nothing is invented: every displayed figure traces to a catalog field, or is reported
       as "Not specified in supplied manual".
 """
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
@@ -44,8 +45,21 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 import catalog_data
 
-DB_PATH = Path(__file__).parent / "database" / "couplings.db"
-engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+# Production (Render) sets DATABASE_URL to the Supabase Postgres connection string.
+# Local development leaves it unset and falls back to the bundled SQLite database, so
+# nothing about local dev changes. Supabase/most providers hand out a bare
+# "postgresql://" (or legacy "postgres://") URL; SQLAlchemy needs the driver named
+# explicitly, so it's rewritten to use the psycopg 3 dialect actually installed below.
+_database_url = os.environ.get("DATABASE_URL")
+if _database_url:
+    if _database_url.startswith("postgres://"):
+        _database_url = _database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif _database_url.startswith("postgresql://"):
+        _database_url = _database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    engine = create_engine(_database_url)
+else:
+    DB_PATH = Path(__file__).parent / "database" / "couplings.db"
+    engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 IN_TO_MM = 25.4
@@ -125,7 +139,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Smart Coupling API", version="4.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
+
+# Local dev origin is always allowed so the deployed backend can still be exercised from
+# a local frontend during testing. Production (Render) additionally allows FRONTEND_URL,
+# the deployed Vercel domain, set via environment variable rather than hardcoded.
+_allowed_origins = ["http://localhost:5173"]
+_frontend_url = os.environ.get("FRONTEND_URL")
+if _frontend_url and _frontend_url not in _allowed_origins:
+    _allowed_origins.append(_frontend_url)
+app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins, allow_methods=["*"], allow_headers=["*"])
 
 
 # ---------------------------------------------------------------------------
